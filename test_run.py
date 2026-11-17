@@ -25,5 +25,8 @@ def main():
     # Test 2: Warszawa <-> Sanok
     test_route(core, "Warszawa", "Sanok", data_badania)
 
+    # Test 3: Łódź <-> Sanok
+    test_route(core, "Łódź", "Sanok", data_badania)
+
 if __name__ == "__main__":
     main()
