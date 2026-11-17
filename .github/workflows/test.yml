@@ -1,0 +1,26 @@
+name: Argus Smoke Test
+
+on:
+  workflow_dispatch: # Pozwala odpalić ręcznie z panelu Actions
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Pobierz kod
+        uses: actions/checkout@v4
+
+      - name: Skonfiguruj Pythona
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Zainstaluj zależności
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests urllib3
+
+      - name: Uruchom test
+        run: |
+          python test_run.py
