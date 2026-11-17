@@ -49,21 +49,10 @@ class ArgusCore:
         "KRAKOW": {"id": "71", "name": "KRAKÓW MDA"},
     }
 
-    def __init__(self, timeout: int = 15):
+    def __init__(self, timeout: int = 20):
         self.timeout = timeout
         self.session = self._init_session()
-        self.headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.7,en;q=0.3",
-            "X-Requested-With": "XMLHttpRequest",
-            "Origin": "https://neobus.pl",
-            "Referer": "https://neobus.pl/",
-        }
+        self._warmed_up = False
 
     def _init_session(self) -> requests.Session:
         session = requests.Session()
@@ -76,7 +65,40 @@ class ArgusCore:
         adapter = HTTPAdapter(max_retries=retries)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
+
+        # Standardowy nagłówek desktopowego Chrome
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+        })
         return session
+
+    def _warmup(self):
+        """Pobiera stronę główną, aby zainicjalizować ciasteczka sesyjne serwera."""
+        if not self._warmed_up:
+            try:
+                headers = {
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Upgrade-Insecure-Requests": "1",
+                }
+                res = self.session.get(self.BASE_URL, headers=headers, timeout=self.timeout)
+                if res.status_code == 200:
+                    self._warmed_up = True
+                    logger.info("Sesja pomyślnie zainicjalizowana (ciasteczka pobrane).")
+                else:
+                    logger.warning(f"Inicjalizacja sesji zwróciła kod {res.status_code}")
+            except Exception as e:
+                logger.error(f"Błąd inicjalizacji sesji: {e}")
 
     def _post_search(
         self,
@@ -88,7 +110,8 @@ class ArgusCore:
         passengers: int = 1,
         ticket_type: str = "student",
     ) -> Optional[dict]:
-        """Wysyła pojedyncze żądanie ajax do modułu neotickets."""
+        self._warmup()
+
         payload = {
             "ajax": "true",
             "dataType": "json",
@@ -99,16 +122,27 @@ class ArgusCore:
             "final_stop": destination_id,
             "passengers": str(passengers),
             "date_there": date_str,
-            "date_return": date_str,  # Ten sam dzień dla obu kierunków
+            "date_return": date_str,
             "initial_stop_name": origin_name,
             "final_stop_name": destination_name,
+        }
+
+        post_headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": "https://neobus.pl",
+            "Referer": "https://neobus.pl/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
         }
 
         try:
             response = self.session.post(
                 self.BASE_URL,
                 data=payload,
-                headers=self.headers,
+                headers=post_headers,
                 timeout=self.timeout,
             )
             if response.status_code == 200:
@@ -122,10 +156,6 @@ class ArgusCore:
 
     @staticmethod
     def _parse_time(item_name: str) -> Tuple[str, str]:
-        """
-        Wyciąga czas odjazdu i przyjazdu z nazwy, np.:
-        '2026-11-30 03-40 - 11:33 WROCŁAW PKS Polbus...' -> ('03:40', '11:33')
-        """
         match = re.search(r"(\d{2})[-:](\d{2})\s*-\s*(\d{2})[:\-](\d{2})", item_name)
         if match:
             dep = f"{match.group(1)}:{match.group(2)}"
@@ -140,17 +170,12 @@ class ArgusCore:
         target_date: str,
         check_seats: bool = False,
     ) -> Tuple[List[Departure], List[Departure]]:
-        """
-        Pobiera kursy tam i z powrotem dla danego dnia (format DD.MM.YYYY).
-        Zwraca krotkę: (kursy_tam, kursy_powrot).
-        """
         orig = self.STOPS.get(origin_key)
         dest = self.STOPS.get(destination_key)
 
         if not orig or not dest:
             raise ValueError(f"Nieznany przystanek: {origin_key} lub {destination_key}")
 
-        # Konwersja formatu daty, jeśli podano YYYY-MM-DD
         if "-" in target_date:
             dt = datetime.strptime(target_date, "%Y-%m-%d")
             dot_date = dt.strftime("%d.%m.%Y")
@@ -213,65 +238,7 @@ class ArgusCore:
                     )
                 )
 
-        # Opcjonalne dokładne badanie liczby miejsc metodą binarnego podziału (passengers: 1..9)
-        if check_seats:
-            self._probe_exact_seats(
-                orig, dest, dot_date, there_departures, return_departures
-            )
-
         logger.info(
             f"Pobrano {len(there_departures)} kursów TAM i {len(return_departures)} kursów Z POWROTEM dla {dot_date}"
         )
         return there_departures, return_departures
-
-    def _probe_exact_seats(
-        self,
-        orig: dict,
-        dest: dict,
-        date_str: str,
-        there_deps: List[Departure],
-        ret_deps: List[Departure],
-    ):
-        """
-        Wykrywa dokładną liczbę miejsc dla kursów przez testowanie wartości passengers (od 9 w dół).
-        """
-        for p in [9, 5, 3, 2]:
-            time.sleep(0.4)
-            data = self._post_search(
-                orig["id"], orig["name"], dest["id"], dest["name"], date_str, passengers=p
-            )
-            if not data or "ga4_data" not in data:
-                continue
-
-            ga4 = data["ga4_data"]
-            # Analiza TAM
-            if len(ga4) > 0:
-                active_times = {
-                    self._parse_time(it["item_name"])[0]
-                    for it in ga4[0].get("items", [])
-                }
-                for dep in there_deps:
-                    if dep.departure_time in active_times and dep.free_seats < p:
-                        dep.free_seats = p
-
-            # Analiza POWRÓT
-            if len(ga4) > 1:
-                active_times = {
-                    self._parse_time(it["item_name"])[0]
-                    for it in ga4[1].get("items", [])
-                }
-                for dep in ret_deps:
-                    if dep.departure_time in active_times and dep.free_seats < p:
-                        dep.free_seats = p
-
-
-if __name__ == "__main__":
-    client = ArgusCore()
-    # Testowy przebieg na trasie Wrocław <-> Sanok na 30.11.2026
-    tam, powrot = client.fetch_roundtrip_day("WROCLAW", "SANOK", "30.11.2026")
-    print(f"\n--- PRZYKŁAD TAM ({len(tam)}) ---")
-    for d in tam:
-        print(f"{d.departure_time} -> {d.arrival_time} | {d.price} zł")
-    print(f"\n--- PRZYKŁAD POWRÓT ({len(powrot)}) ---")
-    for d in powrot:
-        print(f"{d.departure_time} -> {d.arrival_time} | {d.price} zł")
