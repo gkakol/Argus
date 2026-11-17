@@ -1,13 +1,11 @@
-import csv
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta
 import json
 import logging
 import os
 import re
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
@@ -18,10 +16,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("ArgusCore")
-
-# =====================================================================
-#                     STAŁE SIECIOWE Z HERMESA
-# =====================================================================
 
 GATEWAY_ENDPOINT = "https://neobus.pl/"
 HEADERS = {
@@ -118,7 +112,7 @@ class ArgusCore:
                 time.sleep(0.15)
         return None
 
-    def _parse_ga4_item_list(self, items: list) -> Dict[str, dict]:
+    def _parse_ga4_items(self, items: list) -> Dict[str, dict]:
         courses = {}
         for it in items:
             name = it.get("item_name", "")
@@ -135,49 +129,162 @@ class ArgusCore:
                 }
         return courses
 
-    def fetch_roundtrip_day(
+    def query_roundtrip_raw(
         self,
-        from_key: str,
-        to_key: str,
+        from_id: str,
+        from_name: str,
+        to_id: str,
+        to_name: str,
         date_str: str,
         passengers: int = 1,
-    ) -> Tuple[List[Departure], List[Departure]]:
+    ) -> Tuple[Optional[Dict[str, dict]], Optional[Dict[str, dict]]]:
         """
-        Pobiera kursy TAM i Z POWROTEM w jednym żądaniu HTTP.
-        Zwraca: (lista_kursow_tam, lista_kursow_powrot)
+        Pobiera surowe dane kursów w obu kierunkach dla zadanej liczby pasażerów.
+        Zwraca: (slownik_tam, slownik_powrot) lub (None, None) w razie błędu.
         """
-        f_stop = STOPS.get(from_key.lower())
-        t_stop = STOPS.get(to_key.lower())
-        if not f_stop or not t_stop:
-            raise ValueError(f"Nieznany przystanek: {from_key} lub {to_key}")
-
         payload = {
             "ajax": "true",
             "dataType": "json",
             "module": "neotickets",
             "step": "1",
             "ticket_type": "normal",
-            "initial_stop": str(f_stop["id"]),
-            "final_stop": str(t_stop["id"]),
+            "initial_stop": str(from_id),
+            "final_stop": str(to_id),
             "passengers": str(passengers),
             "date_there": date_str,
-            "date_return": date_str,  # Ten sam dzień dla obu stron
-            "initial_stop_name": f_stop["name"],
-            "final_stop_name": t_stop["name"],
+            "date_return": date_str,
+            "initial_stop_name": from_name,
+            "final_stop_name": to_name,
         }
 
         data = self._execute_post(payload)
         if not data or "ga4_data" not in data or len(data["ga4_data"]) == 0:
-            return [], []
+            return None, None
 
         ga4 = data["ga4_data"]
+        there = self._parse_ga4_items(ga4[0].get("items", [])) if len(ga4) > 0 else {}
+        ret = self._parse_ga4_items(ga4[1].get("items", [])) if len(ga4) > 1 else {}
+        return there, ret
+
+    def _query_active_times(
+        self, from_id: str, from_name: str, to_id: str, to_name: str, date_str: str, passengers: int
+    ) -> Tuple[Optional[Set[str]], Optional[Set[str]]]:
+        there_map, ret_map = self.query_roundtrip_raw(
+            from_id, from_name, to_id, to_name, date_str, passengers=passengers
+        )
+        if there_map is None and ret_map is None:
+            return None, None
+        return (
+            set(there_map.keys()) if there_map is not None else set(),
+            set(ret_map.keys()) if ret_map is not None else set(),
+        )
+
+    def _resolve_single_course(
+        self,
+        from_id: str,
+        from_name: str,
+        to_id: str,
+        to_name: str,
+        date_str: str,
+        dep_time: str,
+        direction: str,
+        prev_val: Optional[int] = None,
+    ) -> int:
+        """
+        Wyznacza dokładną liczbę wolnych miejsc (1..MAX_CAPACITY) dla pojedynczego kursu.
+        """
+        def check_dep_exists(pass_cnt: int) -> Optional[bool]:
+            t_set, r_set = self._query_active_times(
+                from_id, from_name, to_id, to_name, date_str, pass_cnt
+            )
+            target = t_set if direction == "THERE" else r_set
+            if target is None:
+                return None
+            return dep_time in target
+
+        # 1. Sprawdzenie z użyciem wartości historycznej
+        if prev_val and isinstance(prev_val, int) and 1 < prev_val <= self.max_capacity:
+            res = check_dep_exists(prev_val)
+            if res is True:
+                if prev_val < self.max_capacity:
+                    res_plus = check_dep_exists(min(self.max_capacity, prev_val + 2))
+                    if res_plus is True:
+                        return min(self.max_capacity, prev_val + 2)
+                return prev_val
+            elif res is False:
+                low, high = 1, prev_val - 1
+            else:
+                return prev_val
+        else:
+            # 2. Szybka sonda na 50 i MAX_CAPACITY
+            res_50 = check_dep_exists(50)
+            if res_50 is True:
+                res_max = check_dep_exists(self.max_capacity)
+                if res_max is True:
+                    return self.max_capacity
+                return 50
+            low, high = 1, 49
+
+        # 3. Wyszukiwanie binarne
+        exact = 1
+        while low <= high:
+            mid = (low + high) // 2
+            res_mid = check_dep_exists(mid)
+            if res_mid is None:
+                return prev_val if (prev_val and isinstance(prev_val, int)) else exact
+            if res_mid is True:
+                exact = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+            time.sleep(0.01)
+
+        return exact
+
+    def fetch_roundtrip_day(
+        self,
+        from_key: str,
+        to_key: str,
+        date_str: str,
+        check_seats: bool = False,
+        prev_seats_there: Optional[Dict[str, int]] = None,
+        prev_seats_return: Optional[Dict[str, int]] = None,
+    ) -> Tuple[List[Departure], List[Departure]]:
+        """
+        Pobiera kursy TAM i POWRÓT na podany dzień (DD.MM.YYYY).
+        Jeśli check_seats=True, precyzyjnie mierzy liczbę wolnych miejsc (1..MAX_CAPACITY).
+        """
+        f_stop = STOPS.get(from_key.lower())
+        t_stop = STOPS.get(to_key.lower())
+        if not f_stop or not t_stop:
+            raise ValueError(f"Nieznany przystanek: {from_key} lub {to_key}")
+
+        there_raw, return_raw = self.query_roundtrip_raw(
+            f_stop["id"], f_stop["name"], t_stop["id"], t_stop["name"], date_str, passengers=1
+        )
+        if not there_raw and not return_raw:
+            return [], []
+
         there_courses: List[Departure] = []
         return_courses: List[Departure] = []
 
-        # 1. Kierunek TAM (ga4_data[0])
-        if len(ga4) > 0 and "items" in ga4[0]:
-            parsed_there = self._parse_ga4_item_list(ga4[0].get("items", []))
-            for dep, info in parsed_there.items():
+        # Przetwarzanie kursów TAM
+        if there_raw:
+            for dep, info in there_raw.items():
+                seats = 1
+                if check_seats:
+                    prev_s = prev_seats_there.get(dep) if prev_seats_there else None
+                    seats = self._resolve_single_course(
+                        f_stop["id"],
+                        f_stop["name"],
+                        t_stop["id"],
+                        t_stop["name"],
+                        date_str,
+                        dep,
+                        direction="THERE",
+                        prev_val=prev_s,
+                    )
+
                 there_courses.append(
                     Departure(
                         route_id=f"{from_key}_{to_key}_{date_str}_{dep.replace(':', '')}",
@@ -187,15 +294,29 @@ class ArgusCore:
                         origin=f_stop["name"],
                         destination=t_stop["name"],
                         price=info["price"],
-                        free_seats=9,
+                        free_seats=seats,
                         direction="THERE",
+                        is_sold_out=(seats == 0),
                     )
                 )
 
-        # 2. Kierunek POWRÓT (ga4_data[1])
-        if len(ga4) > 1 and "items" in ga4[1]:
-            parsed_return = self._parse_ga4_item_list(ga4[1].get("items", []))
-            for dep, info in parsed_return.items():
+        # Przetwarzanie kursów POWRÓT
+        if return_raw:
+            for dep, info in return_raw.items():
+                seats = 1
+                if check_seats:
+                    prev_s = prev_seats_return.get(dep) if prev_seats_return else None
+                    seats = self._resolve_single_course(
+                        f_stop["id"],
+                        f_stop["name"],
+                        t_stop["id"],
+                        t_stop["name"],
+                        date_str,
+                        dep,
+                        direction="RETURN",
+                        prev_val=prev_s,
+                    )
+
                 return_courses.append(
                     Departure(
                         route_id=f"{to_key}_{from_key}_{date_str}_{dep.replace(':', '')}",
@@ -205,8 +326,9 @@ class ArgusCore:
                         origin=t_stop["name"],
                         destination=f_stop["name"],
                         price=info["price"],
-                        free_seats=9,
+                        free_seats=seats,
                         direction="RETURN",
+                        is_sold_out=(seats == 0),
                     )
                 )
 
