@@ -1,3 +1,4 @@
+import csv
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 import json
@@ -29,9 +30,6 @@ HEADERS = {
     "Referer": "https://neobus.pl/",
 }
 
-# =====================================================================
-#        KOMPLETNA BAZA PRZYSTANKÓW NEOBUSA (z formularza HTML)
-# =====================================================================
 ALL_STOPS = {
     "babica_kolonia": {"id": "49", "name": "BABICA Kolonia"},
     "blizne": {"id": "46", "name": "BLIZNE"},
@@ -104,8 +102,9 @@ class Departure:
 
 
 class ArgusCore:
-    def __init__(self, max_capacity: int = 70):
+    def __init__(self, max_capacity: int = 70, archive_dir: str = "archive"):
         self.max_capacity = max_capacity
+        self.archive_dir = archive_dir
         self._thread_local = threading.local()
 
     def get_session(self) -> requests.Session:
@@ -139,35 +138,21 @@ class ArgusCore:
         return low
 
     def resolve_stop(self, stop_query: str) -> dict:
-        """
-        Elastycznie dopasowuje nazwę przystanku podaną przez użytkownika
-        (np. 'wroclaw', 'Wrocław', 'sanok', 'Krosno', 'warszawa').
-        """
         norm_query = self._normalize_string(stop_query)
-
-        # 1. Dokładne dopasowanie klucza
         if norm_query in ALL_STOPS:
             return ALL_STOPS[norm_query]
-
-        # 2. Prefiks lub część klucza (np. 'warszawa' dla 'warszawa_zachodnia')
         for key, data in ALL_STOPS.items():
             if norm_query == key or key.startswith(norm_query) or norm_query in key:
                 return data
-
-        # 3. Wyszukiwanie w oficjalnej pełnej nazwie przystanku
         for data in ALL_STOPS.values():
             if norm_query in self._normalize_string(data["name"]):
                 return data
-
-        raise ValueError(f"Nie znaleziono przystanku dla zapytania: '{stop_query}'. "
-                         f"Dostępne klucze to m.in.: {list(ALL_STOPS.keys())[:10]}...")
+        raise ValueError(f"Nie znaleziono przystanku dla: '{stop_query}'.")
 
     @staticmethod
     def normalize_date(target_date: Union[str, date, datetime]) -> str:
-        """Konwertuje dowolny format daty do 'DD.MM.YYYY'."""
         if isinstance(target_date, (date, datetime)):
             return target_date.strftime("%d.%m.%Y")
-        
         target_date = target_date.strip()
         if "-" in target_date:
             dt = datetime.strptime(target_date, "%Y-%m-%d")
@@ -248,16 +233,117 @@ class ArgusCore:
         ret = self._parse_ga4_items(ga4[1].get("items", [])) if len(ga4) > 1 else {}
         return there, ret
 
+    # =====================================================================
+    #               WARSTWA PAMIĘCI I BAZY DANYCH (CSV)
+    # =====================================================================
+
+    def get_csv_filename(self, origin: str, destination: str) -> str:
+        """Generuje standardową nazwę pliku, np. 'ceny_wroclaw_sanok.csv'."""
+        f_key = self._normalize_string(self.resolve_stop(origin)["name"].split()[0])
+        t_key = self._normalize_string(self.resolve_stop(destination)["name"].split()[0])
+        return f"ceny_{f_key}_{t_key}.csv"
+
+    def load_previous_snapshot(self, csv_file: str) -> Dict[Tuple[str, str], int]:
+        """
+        Wczytuje z pliku CSV ostatnie znane stany wolnych miejsc:
+        Zwraca mapę: {(date_str, dep_time): free_seats}
+        """
+        prev_map = {}
+        if not os.path.isfile(csv_file):
+            return prev_map
+        try:
+            with open(csv_file, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    d = row.get("Data kursu")
+                    h = row.get("Godzina")
+                    s = row.get("Wolne miejsca")
+                    if d and h and s and s.isdigit():
+                        prev_map[(d, h)] = int(s)
+        except Exception as e:
+            logger.debug(f"Brak lub błąd odczytu {csv_file}: {e}")
+        return prev_map
+
+    def save_and_rotate_csv(self, csv_file: str, courses: List[Departure]):
+        """
+        Zapisuje nowe pomiary do bazy CSV oraz automatycznie przenosi
+        przeszłe kursy do archiwum (archive/arch_*.csv).
+        """
+        if not courses:
+            return
+
+        today = date.today()
+        ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        existing_rows = []
+        if os.path.isfile(csv_file):
+            try:
+                with open(csv_file, "r", encoding="utf-8") as f:
+                    existing_rows = list(csv.DictReader(f))
+            except Exception:
+                existing_rows = []
+
+        new_rows = [
+            {
+                "Data pomiaru": ts_now,
+                "Data kursu": c.date,
+                "Godzina": c.departure_time,
+                "Cena (PLN)": f"{c.price:.2f}",
+                "Wolne miejsca": str(c.free_seats),
+            }
+            for c in courses
+        ]
+
+        combined = existing_rows + new_rows
+        active_rows = []
+        archive_rows = []
+
+        for r in combined:
+            try:
+                d_kurs = datetime.strptime(r["Data kursu"], "%d.%m.%Y").date()
+                if d_kurs >= today:
+                    active_rows.append(r)
+                else:
+                    archive_rows.append(r)
+            except Exception:
+                active_rows.append(r)
+
+        # Zapis do archiwum
+        if archive_rows:
+            os.makedirs(self.archive_dir, exist_ok=True)
+            arch_file = os.path.join(self.archive_dir, f"arch_{os.path.basename(csv_file)}")
+            file_exists = os.path.isfile(arch_file)
+            with open(arch_file, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=["Data pomiaru", "Data kursu", "Godzina", "Cena (PLN)", "Wolne miejsca"]
+                )
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerows(archive_rows)
+
+        # Nadpisanie pliku aktywnego
+        with open(csv_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["Data pomiaru", "Data kursu", "Godzina", "Cena (PLN)", "Wolne miejsca"]
+            )
+            writer.writeheader()
+            writer.writerows(active_rows)
+
+    # =====================================================================
+    #               GŁÓWNA METODA Z ADAPTACYJNYM WARM-START
+    # =====================================================================
+
     def fetch_roundtrip_day(
         self,
         origin: str,
         destination: str,
         target_date: Union[str, date, datetime],
         check_seats: bool = True,
+        prev_snapshot: Optional[Dict[Tuple[str, str], int]] = None,
     ) -> Tuple[List[Departure], List[Departure]]:
         """
-        Główna, uniwersalna metoda bota:
-        Pobiera kursy TAM i POWRÓT dla dowolnych dwóch przystanków i dowolnej daty.
+        Pobiera kursy TAM i POWRÓT. 
+        Jeśli przekazano prev_snapshot, używa Warm-Startu drastycznie redukując zapytania HTTP.
         """
         f_stop = self.resolve_stop(origin)
         t_stop = self.resolve_stop(destination)
@@ -265,7 +351,6 @@ class ArgusCore:
 
         logger.info(f"Odpytywanie {f_stop['name']} <-> {t_stop['name']} na {date_str}...")
 
-        # 1. Bazowe zapytanie dla 1 pasażera
         there_base, return_base = self.query_roundtrip_raw(
             f_stop["id"], f_stop["name"], t_stop["id"], t_stop["name"], date_str, passengers=1
         )
@@ -274,36 +359,67 @@ class ArgusCore:
 
         all_courses = []
         for dep, info in (there_base or {}).items():
+            prev_s = prev_snapshot.get((date_str, dep)) if prev_snapshot else None
             all_courses.append({
                 "dep": dep, "info": info, "direction": "THERE",
-                "low": 1, "high": self.max_capacity, "exact": 1
+                "low": 1, "high": self.max_capacity, "exact": 1,
+                "prev_val": prev_s
             })
         for dep, info in (return_base or {}).items():
+            prev_s = prev_snapshot.get((date_str, dep)) if prev_snapshot else None
             all_courses.append({
                 "dep": dep, "info": info, "direction": "RETURN",
-                "low": 1, "high": self.max_capacity, "exact": 1
+                "low": 1, "high": self.max_capacity, "exact": 1,
+                "prev_val": prev_s
             })
 
-        # 2. Kolektywny binary search wolnych foteli
         if check_seats and all_courses:
             cache = {1: (set(there_base.keys()), set(return_base.keys()))}
 
-            # Sonda na 50 i MAX_CAPACITY
-            for probe in [self.max_capacity, 50]:
+            # 1. Warm-Start: sprawdzamy zapamiętane wartości z bazy danych
+            warm_probes = set()
+            for c in all_courses:
+                if c["prev_val"] and isinstance(c["prev_val"], int) and 1 < c["prev_val"] <= self.max_capacity:
+                    warm_probes.add(c["prev_val"])
+                    if c["prev_val"] < self.max_capacity:
+                        warm_probes.add(min(self.max_capacity, c["prev_val"] + 2))
+
+            for probe in sorted(warm_probes, reverse=True):
                 t_map, r_map = self.query_roundtrip_raw(
                     f_stop["id"], f_stop["name"], t_stop["id"], t_stop["name"], date_str, probe
                 )
                 if t_map is not None:
                     cache[probe] = (set(t_map.keys()), set(r_map.keys()))
                     for c in all_courses:
-                        active = cache[probe][0] if c["direction"] == "THERE" else cache[probe][1]
-                        if c["dep"] in active:
-                            c["low"] = probe
-                            c["exact"] = max(c["exact"], probe)
-                        else:
-                            c["high"] = min(c["high"], probe - 1)
+                        if c["prev_val"] == probe or (c["prev_val"] and probe == c["prev_val"] + 2):
+                            active = cache[probe][0] if c["direction"] == "THERE" else cache[probe][1]
+                            if c["dep"] in active:
+                                c["low"] = probe
+                                c["exact"] = max(c["exact"], probe)
+                            else:
+                                c["high"] = min(c["high"], probe - 1)
 
-            # Doprecyzowanie reszty kursów
+            # 2. Sonda na 50 i MAX_CAPACITY dla pozostałych
+            remaining = [c for c in all_courses if c["low"] < c["high"]]
+            if remaining:
+                for probe in [self.max_capacity, 50]:
+                    if probe not in cache:
+                        t_map, r_map = self.query_roundtrip_raw(
+                            f_stop["id"], f_stop["name"], t_stop["id"], t_stop["name"], date_str, probe
+                        )
+                        if t_map is not None:
+                            cache[probe] = (set(t_map.keys()), set(r_map.keys()))
+
+                    if probe in cache:
+                        for c in all_courses:
+                            active = cache[probe][0] if c["direction"] == "THERE" else cache[probe][1]
+                            if c["dep"] in active:
+                                c["low"] = probe
+                                c["exact"] = max(c["exact"], probe)
+                            else:
+                                c["high"] = min(c["high"], probe - 1)
+
+            # 3. Klasyczny binary search dla nierozstrzygniętych
             while True:
                 pending = [c for c in all_courses if c["low"] < c["high"]]
                 if not pending:
@@ -331,7 +447,6 @@ class ArgusCore:
                     else:
                         c["high"] = mid - 1
 
-        # 3. Zwracanie gotowych obiektów
         there_courses: List[Departure] = []
         return_courses: List[Departure] = []
 
