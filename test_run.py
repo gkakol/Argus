@@ -5,8 +5,8 @@ def main():
     print(">>> Uruchamianie ArgusCore (Test: Warm-Start + Zapis CSV + Rotacja)...")
     core = ArgusCore(max_capacity=70)
     data_badania = "25.11.2026"
-    origin = "Wrocław"
-    dest = "Krosno"
+    origin = "Gliwice"
+    dest = "Domaradz"
 
     # Pliki CSV dla relacji TAM i POWRÓT
     csv_tam = core.get_csv_filename(origin, dest)       # ceny_wroclaw_krosno.csv
