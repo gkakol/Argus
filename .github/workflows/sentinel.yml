@@ -1,0 +1,46 @@
+name: Argus Sentinel Radar
+
+on:
+  schedule:
+    - cron: '15 * * * *'  # Uruchomienie co godzinę w 15. minucie
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Pobierz kod
+        uses: actions/checkout@v4
+
+      - name: Skonfiguruj Pythona
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Zainstaluj zależności
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests urllib3
+
+      - name: Uruchom Argus Sentinel
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python argus_sentinel.py
+
+      - name: Zapisz bazy CSV do repozytorium
+        run: |
+          git config --global user.name "Argus Bot"
+          git config --global user.email "argus-bot@github.actions"
+          
+          git add -f data/
+          if git diff --staged --quiet; then
+            echo "Brak nowych zmian w bazach danych."
+          else
+            git commit -m "data(pulse): update route pricing and seat snapshots [skip ci]"
+            git push origin main
+          fi
