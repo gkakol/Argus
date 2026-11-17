@@ -1,7 +1,10 @@
 name: Argus Smoke Test
 
 on:
-  workflow_dispatch: # Pozwala odpalić ręcznie z panelu Actions
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   test:
@@ -21,6 +24,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests urllib3
 
-      - name: Uruchom test
+      - name: Uruchom test i zapisz dane
         run: |
           python test_run.py
+
+      - name: Zapisz i wypchnij zmiany do repozytorium
+        run: |
+          git config --global user.name "Argus Bot"
+          git config --global user.email "argus-bot@github.actions"
+          git add *.csv archive/*.csv 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "Brak nowych zmian w plikach CSV."
+          else
+            git commit -m "data(pulse): update route pricing and seat snapshots [skip ci]"
+            git push origin main
+          fi
