@@ -3,5 +3,6 @@ __pycache__/
 .env
 venv/
 .vscode/
-# Jeśli nie chcesz zaśmiecać historii ciężkimi PNG:
-# *.png
+# Nie blokujemy folderu data:
+!data/
+!data/**
