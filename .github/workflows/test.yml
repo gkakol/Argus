@@ -32,10 +32,14 @@ jobs:
         run: |
           git config --global user.name "Argus Bot"
           git config --global user.email "argus-bot@github.actions"
-          git add *.csv archive/*.csv 2>/dev/null || true
+          
+          # Wymuszenie dodania folderu data/
+          git add -f data/
+          
+          git status
           if git diff --staged --quiet; then
-            echo "Brak nowych zmian w plikach CSV."
+            echo "Brak nowych zmian w katalogu data/."
           else
-            git commit -m "data(pulse): update route pricing and seat snapshots [skip ci]"
+            git commit -m "data(pulse): update route snapshots in data/ [skip ci]"
             git push origin main
           fi
