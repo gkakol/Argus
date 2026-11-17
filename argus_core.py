@@ -250,16 +250,14 @@ class ArgusCore:
     # =====================================================================
 
     def get_csv_filename(self, origin: str, destination: str) -> str:
-        """Generuje pełną ścieżkę w folderze data/, np. 'data/ceny_wroclaw_krosno.csv'."""
         f_key = self._normalize_string(self.resolve_stop(origin)["name"].split()[0])
         t_key = self._normalize_string(self.resolve_stop(destination)["name"].split()[0])
         return os.path.join(self.data_dir, f"ceny_{f_key}_{t_key}.csv")
 
-    def load_previous_snapshot(self, csv_file: str) -> Dict[Tuple[str, str], int]:
+    def load_previous_snapshot(self, csv_file: str) -> Dict[Tuple[str, str], dict]:
         """
-        Wczytuje z pliku CSV ostatnie znane stany wolnych miejsc:
-        Zwraca mapę: {(date_str, dep_time): free_seats}
-        Kompatybilne wstecznie ze starym nagłówkiem 'Godzina' i nowym 'Godzina odjazdu'.
+        Wczytuje z pliku CSV ostatnie znane stany kursów:
+        Zwraca: {(date_str, dep_time): {"seats": int, "price": float}}
         """
         prev_map = {}
         if not os.path.isfile(csv_file):
@@ -271,16 +269,21 @@ class ArgusCore:
                     d = row.get("Data kursu")
                     h = row.get("Godzina odjazdu") or row.get("Godzina")
                     s = row.get("Wolne miejsca")
+                    p = row.get("Cena (PLN)")
                     if d and h and s and s.isdigit():
-                        prev_map[(d, h)] = int(s)
+                        prev_map[(d, h)] = {
+                            "seats": int(s),
+                            "price": float(p) if p else 0.0
+                        }
         except Exception as e:
             logger.debug(f"Brak lub błąd odczytu {csv_file}: {e}")
         return prev_map
 
     def save_and_rotate_csv(self, csv_file: str, courses: List[Departure]):
         """
-        Zapisuje nowe pomiary do bazy CSV z podziałem na godzinę odjazdu i przyjazdu
-        oraz przenosi przeszłe kursy do archiwum (data/archive/arch_*.csv).
+        Inteligentny zapis z deduplikacją:
+        Nowy wiersz dodawany jest TYLKO wtedy, gdy zmieniła się cena lub liczba miejsc.
+        Kursy przeszłe automatycznie rotują do data/archive/.
         """
         if not courses:
             return
@@ -289,30 +292,41 @@ class ArgusCore:
         ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         existing_rows = []
+        last_state = {}  # (Data kursu, Godzina odjazdu) -> row
+
         if os.path.isfile(csv_file):
             try:
                 with open(csv_file, "r", encoding="utf-8") as f:
                     for r in csv.DictReader(f):
-                        # Migracja starej kolumny 'Godzina' jeśli istnieje
                         if "Godzina" in r and "Godzina odjazdu" not in r:
                             r["Godzina odjazdu"] = r.pop("Godzina")
                         if "Godzina przyjazdu" not in r:
                             r["Godzina przyjazdu"] = "--:--"
                         existing_rows.append(r)
+                        last_state[(r["Data kursu"], r["Godzina odjazdu"])] = r
             except Exception:
                 existing_rows = []
 
-        new_rows = [
-            {
-                "Data pomiaru": ts_now,
-                "Data kursu": c.date,
-                "Godzina odjazdu": c.departure_time,
-                "Godzina przyjazdu": c.arrival_time,
-                "Cena (PLN)": f"{c.price:.2f}",
-                "Wolne miejsca": str(c.free_seats),
-            }
-            for c in courses
-        ]
+        new_rows = []
+        for c in courses:
+            prev = last_state.get((c.date, c.departure_time))
+            # Sprawdzamy czy zaszła realna zmiana ceny lub liczby miejsc
+            is_changed = True
+            if prev:
+                prev_price = float(prev.get("Cena (PLN)", 0))
+                prev_seats = int(prev.get("Wolne miejsca", -1))
+                if abs(c.price - prev_price) < 0.01 and c.free_seats == prev_seats:
+                    is_changed = False  # Brak zmian - deduplikacja!
+
+            if is_changed:
+                new_rows.append({
+                    "Data pomiaru": ts_now,
+                    "Data kursu": c.date,
+                    "Godzina odjazdu": c.departure_time,
+                    "Godzina przyjazdu": c.arrival_time,
+                    "Cena (PLN)": f"{c.price:.2f}",
+                    "Wolne miejsca": str(c.free_seats),
+                })
 
         combined = existing_rows + new_rows
         active_rows = []
@@ -328,7 +342,6 @@ class ArgusCore:
             except Exception:
                 active_rows.append(r)
 
-        # Zapis do archiwum w data/archive/
         if archive_rows:
             os.makedirs(self.archive_dir, exist_ok=True)
             arch_file = os.path.join(self.archive_dir, f"arch_{os.path.basename(csv_file)}")
@@ -339,14 +352,13 @@ class ArgusCore:
                     writer.writeheader()
                 writer.writerows(archive_rows)
 
-        # Nadpisanie pliku aktywnego w data/
         with open(csv_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
             writer.writeheader()
             writer.writerows(active_rows)
 
     # =====================================================================
-    #               GŁÓWNA METODA Z ADAPTACYJNYM WARM-START
+    #          PRAWDZIWY, BŁYSKAWICZNY WARM-START + KOLEKTYWNY BS
     # =====================================================================
 
     def fetch_roundtrip_day(
@@ -355,7 +367,7 @@ class ArgusCore:
         destination: str,
         target_date: Union[str, date, datetime],
         check_seats: bool = True,
-        prev_snapshot: Optional[Dict[Tuple[str, str], int]] = None,
+        prev_snapshot: Optional[Dict[Tuple[str, str], dict]] = None,
     ) -> Tuple[List[Departure], List[Departure]]:
         f_stop = self.resolve_stop(origin)
         t_stop = self.resolve_stop(destination)
@@ -371,59 +383,87 @@ class ArgusCore:
 
         all_courses = []
         for dep, info in (there_base or {}).items():
-            prev_s = prev_snapshot.get((date_str, dep)) if prev_snapshot else None
+            prev = prev_snapshot.get((date_str, dep)) if prev_snapshot else None
+            p_seats = prev["seats"] if prev else None
             all_courses.append({
                 "dep": dep, "info": info, "direction": "THERE",
                 "low": 1, "high": self.max_capacity, "exact": 1,
-                "prev_val": prev_s
+                "prev_seats": p_seats, "solved": False
             })
+
         for dep, info in (return_base or {}).items():
-            prev_s = prev_snapshot.get((date_str, dep)) if prev_snapshot else None
+            prev = prev_snapshot.get((date_str, dep)) if prev_snapshot else None
+            p_seats = prev["seats"] if prev else None
             all_courses.append({
                 "dep": dep, "info": info, "direction": "RETURN",
                 "low": 1, "high": self.max_capacity, "exact": 1,
-                "prev_val": prev_s
+                "prev_seats": p_seats, "solved": False
             })
 
         if check_seats and all_courses:
             cache = {1: (set(there_base.keys()), set(return_base.keys()))}
 
-            # 1. Warm-Start: sprawdzamy zapamiętane wartości z bazy danych
-            warm_probes = set()
-            for c in all_courses:
-                if c["prev_val"] and isinstance(c["prev_val"], int) and 1 < c["prev_val"] <= self.max_capacity:
-                    warm_probes.add(c["prev_val"])
-                    if c["prev_val"] < self.max_capacity:
-                        warm_probes.add(min(self.max_capacity, c["prev_val"] + 2))
+            # -----------------------------------------------------------------
+            # KROK 1: Prawdziwy Warm-Start dla kursów ze znaną historią
+            # -----------------------------------------------------------------
+            warm_candidates = [c for c in all_courses if c["prev_seats"] and 1 < c["prev_seats"] <= self.max_capacity]
+            if warm_candidates:
+                # Grupujemy unikalne sondy N
+                probes_needed = sorted({c["prev_seats"] for c in warm_candidates}, reverse=True)
+                for p in probes_needed:
+                    if p not in cache:
+                        t_m, r_m = self.query_roundtrip_raw(
+                            f_stop["id"], f_stop["name"], t_stop["id"], t_stop["name"], date_str, p
+                        )
+                        if t_m is not None:
+                            cache[p] = (set(t_m.keys()), set(r_m.keys()))
 
-            for probe in sorted(warm_probes, reverse=True):
-                t_map, r_map = self.query_roundtrip_raw(
-                    f_stop["id"], f_stop["name"], t_stop["id"], t_stop["name"], date_str, probe
-                )
-                if t_map is not None:
-                    cache[probe] = (set(t_map.keys()), set(r_map.keys()))
-                    for c in all_courses:
-                        if c["prev_val"] == probe or (c["prev_val"] and probe == c["prev_val"] + 2):
-                            active = cache[probe][0] if c["direction"] == "THERE" else cache[probe][1]
-                            if c["dep"] in active:
-                                c["low"] = probe
-                                c["exact"] = max(c["exact"], probe)
+                # Weryfikacja: jeśli kurs wciąż istnieje przy prev_seats -> sprawdzamy czy nie ma zwrotu (+2)
+                for c in warm_candidates:
+                    p = c["prev_seats"]
+                    if p in cache:
+                        active = cache[p][0] if c["direction"] == "THERE" else cache[p][1]
+                        if c["dep"] in active:
+                            # Kurs wciąż ma co najmniej p miejsc. Sprawdzamy szybką sondę na p+2 (zwrot)
+                            p_plus = min(self.max_capacity, p + 2)
+                            if p_plus == p:
+                                c["exact"] = p
+                                c["solved"] = True
                             else:
-                                c["high"] = min(c["high"], probe - 1)
+                                if p_plus not in cache:
+                                    t_m, r_m = self.query_roundtrip_raw(
+                                        f_stop["id"], f_stop["name"], t_stop["id"], t_stop["name"], date_str, p_plus
+                                    )
+                                    if t_m is not None:
+                                        cache[p_plus] = (set(t_m.keys()), set(r_m.keys()))
 
-            # 2. Sonda na 50 i MAX_CAPACITY dla pozostałych
-            remaining = [c for c in all_courses if c["low"] < c["high"]]
-            if remaining:
+                                if p_plus in cache:
+                                    active_plus = cache[p_plus][0] if c["direction"] == "THERE" else cache[p_plus][1]
+                                    c["exact"] = p_plus if c["dep"] in active_plus else p
+                                    c["solved"] = True
+                        else:
+                            # Miejsc ubyło! Wiemy na pewno, że jest w przedziale [1, p - 1]
+                            c["high"] = p - 1
+                            c["exact"] = 1
+
+            # -----------------------------------------------------------------
+            # KROK 2: Kolektywny binary search tylko dla NIEROZSTRZYGNIĘTYCH kursów
+            # -----------------------------------------------------------------
+            unsolved = [c for c in all_courses if not c["solved"]]
+            
+            # Szybka sonda 50 i MAX_CAPACITY dla zupełnie nowych kursów (high=70)
+            fresh = [c for c in unsolved if c["high"] == self.max_capacity]
+            if fresh:
                 for probe in [self.max_capacity, 50]:
                     if probe not in cache:
-                        t_map, r_map = self.query_roundtrip_raw(
+                        t_m, r_m = self.query_roundtrip_raw(
                             f_stop["id"], f_stop["name"], t_stop["id"], t_stop["name"], date_str, probe
                         )
-                        if t_map is not None:
-                            cache[probe] = (set(t_map.keys()), set(r_map.keys()))
+                        if t_m is not None:
+                            cache[probe] = (set(t_m.keys()), set(r_m.keys()))
 
                     if probe in cache:
-                        for c in all_courses:
+                        for c in fresh:
                             active = cache[probe][0] if c["direction"] == "THERE" else cache[probe][1]
                             if c["dep"] in active:
                                 c["low"] = probe
@@ -431,27 +471,25 @@ class ArgusCore:
                             else:
                                 c["high"] = min(c["high"], probe - 1)
 
-            # 3. Klasyczny binary search dla nierozstrzygniętych
+            # Doprecyzowanie reszty
             while True:
-                pending = [c for c in all_courses if c["low"] < c["high"]]
+                pending = [c for c in all_courses if not c["solved"] and c["low"] < c["high"]]
                 if not pending:
                     break
 
                 mid = (pending[0]["low"] + pending[0]["high"]) // 2
 
                 if mid not in cache:
-                    t_map, r_map = self.query_roundtrip_raw(
+                    t_m, r_m = self.query_roundtrip_raw(
                         f_stop["id"], f_stop["name"], t_stop["id"], t_stop["name"], date_str, mid
                     )
-                    if t_map is None:
+                    if t_m is None:
                         break
-                    cache[mid] = (set(t_map.keys()), set(r_map.keys()))
+                    cache[mid] = (set(t_m.keys()), set(r_m.keys()))
 
                 active_there, active_ret = cache[mid]
 
-                for c in all_courses:
-                    if c["low"] >= c["high"]:
-                        continue
+                for c in pending:
                     active = active_there if c["direction"] == "THERE" else active_ret
                     if c["dep"] in active:
                         c["exact"] = mid
