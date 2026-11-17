@@ -35,7 +35,7 @@ class Departure:
 
 
 class ArgusCore:
-    BASE_URL = "https://neobus.pl/"
+    BASE_URL = "https://neobus.pl/pl"
     STOPS = {
         "SANOK": {"id": "17", "name": "SANOK D.A. Lipińskiego "},
         "NIEBYLEC": {"id": "19", "name": "NIEBYLEC"},
@@ -49,7 +49,7 @@ class ArgusCore:
         "KRAKOW": {"id": "71", "name": "KRAKÓW MDA"},
     }
 
-    def __init__(self, timeout: int = 20):
+    def __init__(self, timeout: int = 25):
         self.timeout = timeout
         self.session = self._init_session()
         self._warmed_up = False
@@ -66,7 +66,6 @@ class ArgusCore:
         session.mount("https://", adapter)
         session.mount("http://", adapter)
 
-        # Standardowy nagłówek desktopowego Chrome
         session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -74,18 +73,15 @@ class ArgusCore:
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
             "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
         })
         return session
 
     def _warmup(self):
-        """Pobiera stronę główną, aby zainicjalizować ciasteczka sesyjne serwera."""
+        """Pobiera stronę główną, aby zainicjalizować sesję i ciasteczka."""
         if not self._warmed_up:
             try:
                 headers = {
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                     "Sec-Fetch-Dest": "document",
                     "Sec-Fetch-Mode": "navigate",
                     "Sec-Fetch-Site": "none",
@@ -96,7 +92,7 @@ class ArgusCore:
                     self._warmed_up = True
                     logger.info("Sesja pomyślnie zainicjalizowana (ciasteczka pobrane).")
                 else:
-                    logger.warning(f"Inicjalizacja sesji zwróciła kod {res.status_code}")
+                    logger.warning(f"Warmup status: {res.status_code}")
             except Exception as e:
                 logger.error(f"Błąd inicjalizacji sesji: {e}")
 
@@ -132,7 +128,7 @@ class ArgusCore:
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "X-Requested-With": "XMLHttpRequest",
             "Origin": "https://neobus.pl",
-            "Referer": "https://neobus.pl/",
+            "Referer": "https://neobus.pl/pl",
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
@@ -146,12 +142,17 @@ class ArgusCore:
                 timeout=self.timeout,
             )
             if response.status_code == 200:
-                return response.json()
-            logger.warning(f"HTTP {response.status_code} dla {date_str}")
+                try:
+                    return response.json()
+                except Exception as e:
+                    logger.error(f"Błąd parsowania JSON: {e} | Treść: {response.text[:200]}")
+                    return None
+
+            logger.warning(
+                f"HTTP {response.status_code} dla {date_str} | Odpowiedź: {response.text[:300]}"
+            )
         except requests.exceptions.RequestException as e:
             logger.error(f"Błąd sieci podczas pobierania {date_str}: {e}")
-        except Exception as e:
-            logger.error(f"Błąd dekodowania JSON: {e}")
         return None
 
     @staticmethod
