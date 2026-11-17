@@ -1,11 +1,12 @@
 from dataclasses import asdict, dataclass
+from datetime import date, datetime, timedelta
 import json
 import logging
 import os
 import re
 import threading
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
@@ -28,17 +29,60 @@ HEADERS = {
     "Referer": "https://neobus.pl/",
 }
 
-STOPS = {
-    "sanok": {"id": "17", "name": "SANOK D.A. Lipińskiego"},
-    "wroclaw": {"id": "77", "name": "WROCŁAW PKS Polbus"},
-    "niebylec": {"id": "19", "name": "NIEBYLEC"},
-    "gliwice": {
-        "id": "123",
-        "name": "GLIWICE Centrum Przesiadkowe ul. Składowa 8a",
-    },
+# =====================================================================
+#        KOMPLETNA BAZA PRZYSTANKÓW NEOBUSA (z formularza HTML)
+# =====================================================================
+ALL_STOPS = {
+    "babica_kolonia": {"id": "49", "name": "BABICA Kolonia"},
+    "blizne": {"id": "46", "name": "BLIZNE"},
+    "boguchwala": {"id": "36", "name": "BOGUCHWAŁA ODR"},
+    "brzozow": {"id": "44", "name": "BRZOZÓW Dworzec PKS Plac Grunwaldzki 01"},
+    "busko_zdroj": {"id": "84", "name": "BUSKO- ZDRÓJ MDA ul. Waryńskiego 29"},
+    "domaradz": {"id": "47", "name": "DOMARADZ"},
+    "gliwice": {"id": "123", "name": "GLIWICE Centrum Przesiadkowe ul. Składowa 8a"},
+    "grabownica": {"id": "38", "name": "GRABOWNICA"},
+    "humniska": {"id": "43", "name": "HUMNISKA"},
+    "iwonicz_zdroj": {"id": "21", "name": "IWONICZ Zdrój"},
+    "ilza": {"id": "124", "name": "IŁŻA D.A. ul. Podzamcze 33"},
+    "jaroslaw": {"id": "94", "name": "JAROSŁAW Centr. Przes. PKP"},
     "katowice": {"id": "73", "name": "KATOWICE D.A. ul. Sądowa 5"},
-    "rzeszow": {"id": "76", "name": "RZESZÓW D.A. PKS"},
+    "kielce": {"id": "85", "name": "KIELCE DA ul. Czarnowska 12"},
+    "kolbuszowa": {"id": "23", "name": "KOLBUSZOWA Dw. PKS"},
+    "krakow_balice": {"id": "72", "name": "KRAKÓW Lotnisko Balice"},
     "krakow": {"id": "71", "name": "KRAKÓW MDA"},
+    "krosno": {"id": "22", "name": "KROSNO D.A.st. 4"},
+    "lesko": {"id": "66", "name": "LESKO D.A. ul. Piłsudskiego 50"},
+    "lutcza": {"id": "48", "name": "LUTCZA skrz."},
+    "medyka": {"id": "96", "name": "MEDYKA Granica"},
+    "miejsce_piastowe": {"id": "37", "name": "MIEJSCE PIASTOWE"},
+    "mielec": {"id": "81", "name": "MIELEC D.A. ul Jagiellończyka"},
+    "niebylec": {"id": "19", "name": "NIEBYLEC"},
+    "nowa_deba": {"id": "25", "name": "NOWA DĘBA"},
+    "opatow": {"id": "35", "name": "OPATÓW D.A. ul. Sienkiewicza 19"},
+    "ostrowiec_sw": {"id": "78", "name": "OSTROWIEC Św. D.A."},
+    "piotrkow_tryb": {"id": "92", "name": "PIOTRKÓW TRYB. DA ul.P.O.W. 12"},
+    "polanczyk": {"id": "62", "name": "POLAŃCZYK"},
+    "polanczyk_skrz": {"id": "63", "name": "POLAŃCZYK skrz."},
+    "polaniec": {"id": "82", "name": "POŁANIEC D.A. (Galeria Połaniecka)"},
+    "przemysl": {"id": "95", "name": "PRZEMYŚL Dw.PKS"},
+    "radom_idalska": {"id": "54", "name": "RADOM Słowackiego/Idalińska"},
+    "radom": {"id": "55", "name": "RADOM Warszawska (rondo)"},
+    "rymanow": {"id": "24", "name": "RYMANÓW Rynek"},
+    "rymanow_zdroj": {"id": "29", "name": "RYMANÓW Zdrój Góra"},
+    "rzeszow": {"id": "76", "name": "RZESZÓW D.A. PKS"},
+    "sanok": {"id": "17", "name": "SANOK D.A. Lipińskiego"},
+    "solina": {"id": "64", "name": "SOLINA"},
+    "stara_wies": {"id": "39", "name": "STARA WIEŚ,"},
+    "staszow": {"id": "83", "name": "STASZÓW Rynek 01/02"},
+    "tarnobrzeg": {"id": "79", "name": "TARNOBRZEG D.A."},
+    "warszawa": {"id": "75", "name": "WARSZAWA Dw. Zach. st.7"},
+    "warszawa_chopin": {"id": "28", "name": "WARSZAWA Lotn. Chopina"},
+    "wroclaw": {"id": "77", "name": "WROCŁAW PKS Polbus"},
+    "zagorz": {"id": "68", "name": "ZAGÓRZ osiedle"},
+    "zarnow": {"id": "115", "name": "ŻARNÓW Pl.Piłsudskiego/Rynek"},
+    "lodz_fabryczna": {"id": "93", "name": "ŁÓDŹ FABRYCZNA WPA"},
+    "lodz": {"id": "88", "name": "ŁÓDŹ KALISKA Włókniarzy/Karolewska"},
+    "loniow": {"id": "53", "name": "ŁONIÓW"},
 }
 
 
@@ -83,6 +127,54 @@ class ArgusCore:
         return self._thread_local.session
 
     @staticmethod
+    def _normalize_string(text: str) -> str:
+        replacements = {
+            "ą": "a", "ć": "c", "ę": "e", "ł": "l", "ń": "n",
+            "ó": "o", "ś": "s", "ź": "z", "ż": "z",
+            " ": "_", "-": "_", ".": ""
+        }
+        low = text.lower().strip()
+        for k, v in replacements.items():
+            low = low.replace(k, v)
+        return low
+
+    def resolve_stop(self, stop_query: str) -> dict:
+        """
+        Elastycznie dopasowuje nazwę przystanku podaną przez użytkownika
+        (np. 'wroclaw', 'Wrocław', 'sanok', 'Krosno', 'warszawa').
+        """
+        norm_query = self._normalize_string(stop_query)
+
+        # 1. Dokładne dopasowanie klucza
+        if norm_query in ALL_STOPS:
+            return ALL_STOPS[norm_query]
+
+        # 2. Prefiks lub część klucza (np. 'warszawa' dla 'warszawa_zachodnia')
+        for key, data in ALL_STOPS.items():
+            if norm_query == key or key.startswith(norm_query) or norm_query in key:
+                return data
+
+        # 3. Wyszukiwanie w oficjalnej pełnej nazwie przystanku
+        for data in ALL_STOPS.values():
+            if norm_query in self._normalize_string(data["name"]):
+                return data
+
+        raise ValueError(f"Nie znaleziono przystanku dla zapytania: '{stop_query}'. "
+                         f"Dostępne klucze to m.in.: {list(ALL_STOPS.keys())[:10]}...")
+
+    @staticmethod
+    def normalize_date(target_date: Union[str, date, datetime]) -> str:
+        """Konwertuje dowolny format daty do 'DD.MM.YYYY'."""
+        if isinstance(target_date, (date, datetime)):
+            return target_date.strftime("%d.%m.%Y")
+        
+        target_date = target_date.strip()
+        if "-" in target_date:
+            dt = datetime.strptime(target_date, "%Y-%m-%d")
+            return dt.strftime("%d.%m.%Y")
+        return target_date
+
+    @staticmethod
     def normalize_time(t: str) -> str:
         return re.sub(r"[-]", ":", t.strip())
 
@@ -94,7 +186,7 @@ class ArgusCore:
                     GATEWAY_ENDPOINT, data=payload, headers=HEADERS, timeout=7
                 )
                 if r.status_code != 200:
-                    time.sleep(0.1)
+                    time.sleep(0.08)
                     continue
 
                 raw = r.json() if hasattr(r, "json") else json.loads(r.text)
@@ -103,7 +195,7 @@ class ArgusCore:
                 if isinstance(data, dict):
                     return data
             except Exception:
-                time.sleep(0.1)
+                time.sleep(0.08)
         return None
 
     def _parse_ga4_items(self, items: list) -> Dict[str, dict]:
@@ -158,28 +250,28 @@ class ArgusCore:
 
     def fetch_roundtrip_day(
         self,
-        from_key: str,
-        to_key: str,
-        date_str: str,
-        check_seats: bool = False,
+        origin: str,
+        destination: str,
+        target_date: Union[str, date, datetime],
+        check_seats: bool = True,
     ) -> Tuple[List[Departure], List[Departure]]:
         """
-        Zoptymalizowana wersja kolektywna:
-        Zamiast odpytywać każdy kurs osobno, wykonuje globalny binary search (maks. 6-7 zapytań na cały dzień!).
+        Główna, uniwersalna metoda bota:
+        Pobiera kursy TAM i POWRÓT dla dowolnych dwóch przystanków i dowolnej daty.
         """
-        f_stop = STOPS.get(from_key.lower())
-        t_stop = STOPS.get(to_key.lower())
-        if not f_stop or not t_stop:
-            raise ValueError(f"Nieznany przystanek: {from_key} lub {to_key}")
+        f_stop = self.resolve_stop(origin)
+        t_stop = self.resolve_stop(destination)
+        date_str = self.normalize_date(target_date)
 
-        # 1. Bazowe zapytanie (passengers=1) - wykrywa wszystkie dostępne kursy
+        logger.info(f"Odpytywanie {f_stop['name']} <-> {t_stop['name']} na {date_str}...")
+
+        # 1. Bazowe zapytanie dla 1 pasażera
         there_base, return_base = self.query_roundtrip_raw(
             f_stop["id"], f_stop["name"], t_stop["id"], t_stop["name"], date_str, passengers=1
         )
         if not there_base and not return_base:
             return [], []
 
-        # Struktura kursów do monitorowania
         all_courses = []
         for dep, info in (there_base or {}).items():
             all_courses.append({
@@ -192,11 +284,11 @@ class ArgusCore:
                 "low": 1, "high": self.max_capacity, "exact": 1
             })
 
-        # 2. Kolektywny binary search (jeśli włączony)
+        # 2. Kolektywny binary search wolnych foteli
         if check_seats and all_courses:
             cache = {1: (set(there_base.keys()), set(return_base.keys()))}
 
-            # Szybki check dla 50 i MAX_CAPACITY (często kursy są prawie puste)
+            # Sonda na 50 i MAX_CAPACITY
             for probe in [self.max_capacity, 50]:
                 t_map, r_map = self.query_roundtrip_raw(
                     f_stop["id"], f_stop["name"], t_stop["id"], t_stop["name"], date_str, probe
@@ -211,13 +303,12 @@ class ArgusCore:
                         else:
                             c["high"] = min(c["high"], probe - 1)
 
-            # Pętla binary search dopóki jakikolwiek kurs ma nierozstrzygnięty przedział
+            # Doprecyzowanie reszty kursów
             while True:
                 pending = [c for c in all_courses if c["low"] < c["high"]]
                 if not pending:
                     break
 
-                # Wybieramy mid jednego z nieustalonych kursów
                 mid = (pending[0]["low"] + pending[0]["high"]) // 2
 
                 if mid not in cache:
@@ -225,7 +316,6 @@ class ArgusCore:
                         f_stop["id"], f_stop["name"], t_stop["id"], t_stop["name"], date_str, mid
                     )
                     if t_map is None:
-                        # W razie błędu sieci przerywamy i zostawiamy dotychczasowe oszacowanie
                         break
                     cache[mid] = (set(t_map.keys()), set(r_map.keys()))
 
@@ -241,24 +331,29 @@ class ArgusCore:
                     else:
                         c["high"] = mid - 1
 
-        # 3. Złożenie wynikowych obiektów Departure
+        # 3. Zwracanie gotowych obiektów
         there_courses: List[Departure] = []
         return_courses: List[Departure] = []
 
         for c in all_courses:
+            is_there = (c["direction"] == "THERE")
+            orig_name = f_stop["name"] if is_there else t_stop["name"]
+            dest_name = t_stop["name"] if is_there else f_stop["name"]
+            route_slug = f"{self._normalize_string(origin)}_{self._normalize_string(destination)}" if is_there else f"{self._normalize_string(destination)}_{self._normalize_string(origin)}"
+
             dep_obj = Departure(
-                route_id=f"{from_key}_{to_key}_{date_str}_{c['dep'].replace(':', '')}" if c["direction"] == "THERE" else f"{to_key}_{from_key}_{date_str}_{c['dep'].replace(':', '')}",
+                route_id=f"{route_slug}_{date_str}_{c['dep'].replace(':', '')}",
                 date=date_str,
                 departure_time=c["info"]["dep"],
                 arrival_time=c["info"]["arr"],
-                origin=f_stop["name"] if c["direction"] == "THERE" else t_stop["name"],
-                destination=t_stop["name"] if c["direction"] == "THERE" else f_stop["name"],
+                origin=orig_name,
+                destination=dest_name,
                 price=c["info"]["price"],
                 free_seats=c["exact"],
                 direction=c["direction"],
                 is_sold_out=(c["exact"] == 0),
             )
-            if c["direction"] == "THERE":
+            if is_there:
                 there_courses.append(dep_obj)
             else:
                 return_courses.append(dep_obj)
