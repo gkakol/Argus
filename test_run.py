@@ -1,36 +1,29 @@
 from argus_core import ArgusCore
 
-def main():
-    print(">>> Uruchamianie ArgusCore (Test wykrywania wolnych miejsc)...")
-    core = ArgusCore(max_capacity=70)
-
-    test_date = "25.11.2026"
-    print(f">>> Analizuję trasę Wrocław <-> Sanok na dzień {test_date} (check_seats=True)...")
-
-    tam, powrot = core.fetch_roundtrip_day(
-        "wroclaw", "sanok", test_date, check_seats=True
-    )
-
+def test_route(core: ArgusCore, origin: str, destination: str, target_date: str):
     print("\n" + "=" * 65)
-    print(f"🚌 KIERUNEK TAM: Wrocław -> Sanok (kursów: {len(tam)})")
+    print(f"🚀 TESTOWANIE RELACJI: {origin.upper()} <---> {destination.upper()} ({target_date})")
     print("=" * 65)
+
+    tam, powrot = core.fetch_roundtrip_day(origin, destination, target_date, check_seats=True)
+
+    print(f"\n🚌 TAM ({origin} -> {destination}) | Kursów: {len(tam)}")
     for k in tam:
-        print(
-            f"  Odjazd: {k.departure_time} -> {k.arrival_time} | "
-            f"Cena: {k.price:6.2f} PLN | "
-            f"Wolne fotele: {k.free_seats:2d} szt."
-        )
+        print(f"  [{k.departure_time} -> {k.arrival_time}] {k.price:6.2f} zł | Miejsca: {k.free_seats:2d} | {k.origin} -> {k.destination}")
 
-    print("\n" + "=" * 65)
-    print(f"🚌 KIERUNEK POWRÓT: Sanok -> Wrocław (kursów: {len(powrot)})")
-    print("=" * 65)
+    print(f"\n🚌 POWRÓT ({destination} -> {origin}) | Kursów: {len(powrot)}")
     for k in powrot:
-        print(
-            f"  Odjazd: {k.departure_time} -> {k.arrival_time} | "
-            f"Cena: {k.price:6.2f} PLN | "
-            f"Wolne fotele: {k.free_seats:2d} szt."
-        )
-    print("=" * 65)
+        print(f"  [{k.departure_time} -> {k.arrival_time}] {k.price:6.2f} zł | Miejsca: {k.free_seats:2d} | {k.origin} -> {k.destination}")
+
+def main():
+    core = ArgusCore(max_capacity=70)
+    data_badania = "25.11.2026"
+
+    # Test 1: Wrocław <-> Krosno
+    test_route(core, "Wrocław", "Krosno", data_badania)
+
+    # Test 2: Warszawa <-> Sanok
+    test_route(core, "Warszawa", "Sanok", data_badania)
 
 if __name__ == "__main__":
     main()
