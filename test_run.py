@@ -1,10 +1,32 @@
 import json
 import requests
 
-def debug_neobus():
-    url = "https://neobus.pl/"
+def test_session():
+    session = requests.Session()
     
-    # Dokładne dane formularza jak z przeglądarki
+    # 1. Dokładne nagłówki przeglądarkowe
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+    })
+
+    # Testujemy który adres jest kanoniczny (czy https://neobus.pl/ czy https://www.neobus.pl/)
+    print(">>> 1. Wykonuję GET na stronę główną, aby złapać ciasteczka sesyjne z nazwa.pl...")
+    
+    # max_redirects chroni przed pętlą
+    session.max_redirects = 5
+    
+    try:
+        # Próbujemy wejść na stronę główną
+        r_get = session.get("https://neobus.pl/", timeout=15)
+        print(f">>> GET Status: {r_get.status_code} | Ostateczny URL: {r_get.url}")
+        print(f">>> Pobrane ciasteczka: {session.cookies.get_dict()}")
+        target_url = r_get.url  # Użyjemy adresu, na który ostatecznie skierował serwer
+    except Exception as e:
+        print(f">>> Błąd GET: {e}")
+        target_url = "https://neobus.pl/"
+
+    # 2. Teraz wysyłamy POST z tymi samymi ciasteczkami sesyjnymi
     payload = {
         "ajax": "true",
         "dataType": "json",
@@ -20,37 +42,33 @@ def debug_neobus():
         "final_stop_name": "SANOK D.A. Lipińskiego ",
     }
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    post_headers = {
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
-        "Referer": "https://neobus.pl/",
-        "Origin": "https://neobus.pl",
+        "Origin": target_url.rstrip("/"),
+        "Referer": target_url,
     }
 
-    print(">>> Wysyłam bezpośrednie żądanie POST...")
-    response = requests.post(url, data=payload, headers=headers, timeout=20)
-    
-    print(f">>> Status HTTP: {response.status_code}")
-    print(f">>> Nagłówki odpowiedzi: {dict(response.headers)}")
-    
+    print(f"\n>>> 2. Wysyłam POST na: {target_url} z ciasteczkami...")
     try:
-        data = response.json()
-        print(f">>> Typ odpowiedzi: JSON")
-        print(f">>> Główne klucze w JSON: {list(data.keys())}")
+        r_post = session.post(target_url, data=payload, headers=post_headers, timeout=20)
+        print(f">>> POST Status: {r_post.status_code}")
         
-        if "ga4_data" in data:
-            print(">>> SUKCES: 'ga4_data' jest w odpowiedzi!")
-            print(json.dumps(data["ga4_data"], indent=2, ensure_ascii=False)[:600])
-        else:
-            print(">>> BRAK 'ga4_data'. Pełny zrzut JSON:")
-            print(json.dumps(data, indent=2, ensure_ascii=False)[:1000])
-            
+        try:
+            res_json = r_post.json()
+            print(">>> SUKCES! Otrzymano JSON:")
+            print(f">>> Klucze: {list(res_json.keys())}")
+            if "ga4_data" in res_json:
+                print(">>> ga4_data znalezione! Liczba relacji:", len(res_json["ga4_data"]))
+                for rel in res_json["ga4_data"]:
+                    print("   -", rel.get("item_list_name"), f"(kursów: {len(rel.get('items', []))})")
+        except Exception:
+            print(">>> Odpowiedź POST to nie JSON. Treść:")
+            print(r_post.text[:400])
+
     except Exception as e:
-        print(f">>> Odpowiedź NIE JEST JSON-em. Błąd: {e}")
-        print(">>> Początek treści odpowiedzi:")
-        print(response.text[:1000])
+        print(f">>> Błąd POST: {e}")
 
 if __name__ == "__main__":
-    debug_neobus()
+    test_session()
