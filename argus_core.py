@@ -1,9 +1,12 @@
-import logging
-import random
-import re
-import time
+import csv
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
+import json
+import logging
+import os
+import re
+import threading
+import time
 from typing import Dict, List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
@@ -16,189 +19,300 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ArgusCore")
 
+# =====================================================================
+#                     STAŁE SIECIOWE Z HERMESA
+# =====================================================================
+
+GATEWAY_ENDPOINT = "https://neobus.pl/"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:154.0) Gecko/20100101 Firefox/154.0",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "pl,en-US;q=0.9,en;q=0.8",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "X-Requested-With": "XMLHttpRequest",
+    "Origin": "https://neobus.pl",
+    "Referer": "https://neobus.pl/",
+}
+
+STOPS = {
+    "sanok": {"id": "17", "name": "SANOK D.A. Lipińskiego"},
+    "wroclaw": {"id": "77", "name": "WROCŁAW PKS Polbus"},
+    "niebylec": {"id": "19", "name": "NIEBYLEC"},
+    "gliwice": {
+        "id": "123",
+        "name": "GLIWICE Centrum Przesiadkowe ul. Składowa 8a",
+    },
+    "katowice": {"id": "73", "name": "KATOWICE D.A. ul. Sądowa 5"},
+    "rzeszow": {"id": "76", "name": "RZESZÓW D.A. PKS"},
+    "krakow": {"id": "71", "name": "KRAKÓW MDA"},
+}
+
 
 @dataclass
 class Departure:
     route_id: str
-    date: str  # YYYY-MM-DD
+    date: str  # DD.MM.YYYY
     departure_time: str  # HH:MM
     arrival_time: str  # HH:MM
     origin: str
     destination: str
     price: float
     free_seats: int
-    is_sold_out: bool
-    direction: str  # "THERE" lub "RETURN"
+    is_sold_out: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 class ArgusCore:
-    BASE_URL = "https://neobus.pl/"
-    STOPS = {
-        "SANOK": {"id": "17", "name": "SANOK D.A. Lipińskiego "},
-        "NIEBYLEC": {"id": "19", "name": "NIEBYLEC"},
-        "WROCLAW": {"id": "77", "name": "WROCŁAW PKS Polbus"},
-        "GLIWICE": {
-            "id": "123",
-            "name": "GLIWICE Centrum Przesiadkowe ul. Składowa 8a",
-        },
-        "KATOWICE": {"id": "73", "name": "KATOWICE D.A. ul. Sądowa 5"},
-        "RZESZOW": {"id": "76", "name": "RZESZÓW D.A. PKS"},
-        "KRAKOW": {"id": "71", "name": "KRAKÓW MDA"},
-    }
+    def __init__(self, max_capacity: int = 70):
+        self.max_capacity = max_capacity
+        self._thread_local = threading.local()
 
-    def __init__(self, timeout: int = 25):
-        self.timeout = timeout
-        self.session = self._init_session()
+    def get_session(self) -> requests.Session:
+        if not hasattr(self._thread_local, "session"):
+            s = requests.Session()
+            retries = Retry(
+                total=3, backoff_factor=0.4, status_forcelist=[500, 502, 503, 504]
+            )
+            adapter = HTTPAdapter(
+                max_retries=retries, pool_connections=5, pool_maxsize=10
+            )
+            s.mount("https://", adapter)
+            s.mount("http://", adapter)
+            try:
+                s.get(GATEWAY_ENDPOINT, headers=HEADERS, timeout=8)
+            except Exception:
+                pass
+            self._thread_local.session = s
+        return self._thread_local.session
 
-    def _init_session(self) -> requests.Session:
-        session = requests.Session()
-        retries = Retry(
-            total=3,
-            backoff_factor=1.0,
-            status_forcelist=[500, 502, 503, 504],
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retries)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        return session
+    @staticmethod
+    def normalize_time(t: str) -> str:
+        return re.sub(r"[-]", ":", t.strip())
 
-    def _post_search(
+    def query_api(
         self,
-        origin_id: str,
-        origin_name: str,
-        destination_id: str,
-        destination_name: str,
+        from_id: str,
+        from_name: str,
+        to_id: str,
+        to_name: str,
         date_str: str,
         passengers: int = 1,
-        ticket_type: str = "student",
-    ) -> Optional[dict]:
+    ) -> Optional[Dict[str, dict]]:
+        """
+        Zwraca słownik znalezionych kursów w formacie:
+        { "HH:MM": {"hours": "HH:MM -> HH:MM", "price": float} }
+        """
+        session = self.get_session()
         payload = {
             "ajax": "true",
             "dataType": "json",
             "module": "neotickets",
             "step": "1",
-            "ticket_type": ticket_type,
-            "initial_stop": origin_id,
-            "final_stop": destination_id,
+            "ticket_type": "normal",
+            "initial_stop": str(from_id),
+            "final_stop": str(to_id),
             "passengers": str(passengers),
             "date_there": date_str,
-            "date_return": date_str,
-            "initial_stop_name": origin_name,
-            "final_stop_name": destination_name,
+            "date_return": "",
+            "initial_stop_name": from_name,
+            "final_stop_name": to_name,
         }
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": "https://neobus.pl/",
-            "Origin": "https://neobus.pl",
-        }
+        for attempt in range(2):
+            try:
+                r = session.post(
+                    GATEWAY_ENDPOINT, data=payload, headers=HEADERS, timeout=7
+                )
+                if r.status_code != 200:
+                    time.sleep(0.15)
+                    continue
 
-        try:
-            response = self.session.post(
-                self.BASE_URL,
-                data=payload,
-                headers=headers,
-                timeout=self.timeout,
-                allow_redirects=True,
-            )
-            if response.status_code == 200:
-                try:
-                    return response.json()
-                except Exception as e:
-                    logger.error(f"Niepoprawny JSON: {e} | Treść: {response.text[:150]}")
-                    return None
+                raw = r.json() if hasattr(r, "json") else json.loads(r.text)
+                content = (
+                    raw.get("neotickets", raw) if isinstance(raw, dict) else raw
+                )
+                data = (
+                    json.loads(content)
+                    if isinstance(content, str)
+                    else content
+                )
 
-            logger.warning(f"HTTP {response.status_code} dla {date_str}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Błąd sieci: {e}")
+                courses = {}
+                if (
+                    isinstance(data, dict)
+                    and "ga4_data" in data
+                    and len(data["ga4_data"]) > 0
+                ):
+                    for it in data["ga4_data"][0].get("items", []):
+                        name = it.get("item_name", "")
+                        price = float(
+                            it.get("price") or it.get("discount", 0.0) or 0.0
+                        )
+                        m = re.search(
+                            r"(\d{2}[-:]\d{2})\s*-\s*(\d{2}[-:]\d{2})", name
+                        )
+                        if m and price > 0:
+                            dep = self.normalize_time(m.group(1))
+                            arr = self.normalize_time(m.group(2))
+                            courses[dep] = {
+                                "hours": f"{dep} -> {arr}",
+                                "dep": dep,
+                                "arr": arr,
+                                "price": price,
+                            }
+                return courses
+            except Exception:
+                time.sleep(0.15)
         return None
 
-    @staticmethod
-    def _parse_time(item_name: str) -> Tuple[str, str]:
-        match = re.search(r"(\d{2})[-:](\d{2})\s*-\s*(\d{2})[:\-](\d{2})", item_name)
-        if match:
-            dep = f"{match.group(1)}:{match.group(2)}"
-            arr = f"{match.group(3)}:{match.group(4)}"
-            return dep, arr
-        return "--:--", "--:--"
-
-    def fetch_roundtrip_day(
+    def query_day_seats_map(
         self,
-        origin_key: str,
-        destination_key: str,
-        target_date: str,
-        check_seats: bool = False,
-    ) -> Tuple[List[Departure], List[Departure]]:
-        orig = self.STOPS.get(origin_key)
-        dest = self.STOPS.get(destination_key)
-
-        if not orig or not dest:
-            raise ValueError(f"Nieznany przystanek: {origin_key} lub {destination_key}")
-
-        if "-" in target_date:
-            dt = datetime.strptime(target_date, "%Y-%m-%d")
-            dot_date = dt.strftime("%d.%m.%Y")
-            iso_date = target_date
-        else:
-            dot_date = target_date
-            iso_date = datetime.strptime(target_date, "%d.%m.%Y").strftime("%Y-%m-%d")
-
-        logger.info(f"Odpytywanie {origin_key} <-> {destination_key} na {dot_date}...")
-        time.sleep(random.uniform(0.3, 0.8))
-
-        data = self._post_search(
-            orig["id"], orig["name"], dest["id"], dest["name"], dot_date, passengers=1
+        from_id: str,
+        from_name: str,
+        to_id: str,
+        to_name: str,
+        date_str: str,
+        passengers: int,
+    ) -> Optional[set]:
+        data = self.query_api(
+            from_id, from_name, to_id, to_name, date_str, passengers=passengers
         )
-        if not data or "ga4_data" not in data:
-            logger.warning(f"Brak ga4_data dla {dot_date}")
-            return [], []
+        if data is None:
+            return None
+        return set(data.keys())
 
-        ga4 = data["ga4_data"]
-        there_departures: List[Departure] = []
-        return_departures: List[Departure] = []
-
-        if len(ga4) > 0 and "items" in ga4[0]:
-            for item in ga4[0]["items"]:
-                dep_time, arr_time = self._parse_time(item["item_name"])
-                there_departures.append(
-                    Departure(
-                        route_id=f"{origin_key}_{destination_key}_{iso_date}_{dep_time.replace(':', '')}",
-                        date=iso_date,
-                        departure_time=dep_time,
-                        arrival_time=arr_time,
-                        origin=orig["name"].strip(),
-                        destination=dest["name"].strip(),
-                        price=float(item.get("price", 0.0)),
-                        free_seats=9 if not check_seats else 1,
-                        is_sold_out=False,
-                        direction="THERE",
+    def resolve_course_adaptive(
+        self,
+        from_id: str,
+        from_name: str,
+        to_id: str,
+        to_name: str,
+        date_str: str,
+        dep: str,
+        prev_val: Optional[int] = None,
+    ) -> int:
+        """
+        Szybki algorytm adaptacyjny badający liczbę wolnych miejsc (1..MAX_CAPACITY).
+        """
+        if (
+            prev_val
+            and isinstance(prev_val, int)
+            and 1 < prev_val <= self.max_capacity
+        ):
+            map_prev = self.query_day_seats_map(
+                from_id, from_name, to_id, to_name, date_str, prev_val
+            )
+            if map_prev is not None and dep in map_prev:
+                if prev_val < self.max_capacity:
+                    map_plus = self.query_day_seats_map(
+                        from_id,
+                        from_name,
+                        to_id,
+                        to_name,
+                        date_str,
+                        min(self.max_capacity, prev_val + 2),
                     )
+                    if map_plus is not None and dep in map_plus:
+                        return min(self.max_capacity, prev_val + 2)
+                return prev_val
+            else:
+                low, high = 1, prev_val - 1
+        else:
+            map_50 = self.query_day_seats_map(
+                from_id, from_name, to_id, to_name, date_str, 50
+            )
+            if map_50 is not None and dep in map_50:
+                map_max = self.query_day_seats_map(
+                    from_id, from_name, to_id, to_name, date_str, self.max_capacity
+                )
+                if map_max is not None and dep in map_max:
+                    return self.max_capacity
+                return 50
+            low, high = 1, 49
+
+        exact = 1
+        while low <= high:
+            mid = (low + high) // 2
+            day_map = self.query_day_seats_map(
+                from_id, from_name, to_id, to_name, date_str, mid
+            )
+            if day_map is None:
+                return (
+                    prev_val
+                    if (prev_val and isinstance(prev_val, int))
+                    else 1
+                )
+            if dep in day_map:
+                exact = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+            time.sleep(0.01)
+
+        return exact
+
+    def fetch_route_day(
+        self,
+        from_key: str,
+        to_key: str,
+        date_str: str,
+        check_seats: bool = False,
+        prev_seats: Optional[Dict[str, int]] = None,
+    ) -> List[Departure]:
+        """
+        Pobiera kursy dla zadanego kierunku i daty (DD.MM.YYYY).
+        """
+        f_stop = STOPS.get(from_key.lower())
+        t_stop = STOPS.get(to_key.lower())
+        if not f_stop or not t_stop:
+            raise ValueError(f"Nieznany przystanek: {from_key} lub {to_key}")
+
+        raw_courses = self.query_api(
+            f_stop["id"], f_stop["name"], t_stop["id"], t_stop["name"], date_str, 1
+        )
+        if not raw_courses:
+            return []
+
+        results: List[Departure] = []
+        for dep, info in raw_courses.items():
+            seats = 9
+            if check_seats:
+                prev_s = prev_seats.get(dep) if prev_seats else None
+                seats = self.resolve_course_adaptive(
+                    f_stop["id"],
+                    f_stop["name"],
+                    t_stop["id"],
+                    t_stop["name"],
+                    date_str,
+                    dep,
+                    prev_s,
                 )
 
-        if len(ga4) > 1 and "items" in ga4[1]:
-            for item in ga4[1]["items"]:
-                dep_time, arr_time = self._parse_time(item["item_name"])
-                return_departures.append(
-                    Departure(
-                        route_id=f"{destination_key}_{origin_key}_{iso_date}_{dep_time.replace(':', '')}",
-                        date=iso_date,
-                        departure_time=dep_time,
-                        arrival_time=arr_time,
-                        origin=dest["name"].strip(),
-                        destination=orig["name"].strip(),
-                        price=float(item.get("price", 0.0)),
-                        free_seats=9 if not check_seats else 1,
-                        is_sold_out=False,
-                        direction="RETURN",
-                    )
+            route_id = f"{from_key}_{to_key}_{date_str}_{dep.replace(':', '')}"
+            results.append(
+                Departure(
+                    route_id=route_id,
+                    date=date_str,
+                    departure_time=info["dep"],
+                    arrival_time=info["arr"],
+                    origin=f_stop["name"],
+                    destination=t_stop["name"],
+                    price=info["price"],
+                    free_seats=seats,
+                    is_sold_out=(seats == 0),
                 )
+            )
 
-        logger.info(f"Pobrano {len(there_departures)} kursów TAM i {len(return_departures)} Z POWROTEM dla {dot_date}")
-        return there_departures, return_departures
+        return sorted(results, key=lambda x: x.departure_time)
+
+
+if __name__ == "__main__":
+    core = ArgusCore()
+    today_str = (date.today() + timedelta(days=5)).strftime("%d.%m.%Y")
+    print(f"Test pobierania Wrocław -> Sanok na {today_str}...")
+    kursy = core.fetch_route_day("wroclaw", "sanok", today_str, check_seats=False)
+    print(f"Znaleziono {len(kursy)} kursów:")
+    for k in kursy:
+        print(f"  {k.departure_time} -> {k.arrival_time} | {k.price:.2f} zł")
