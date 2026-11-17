@@ -83,6 +83,15 @@ ALL_STOPS = {
     "loniow": {"id": "53", "name": "ŁONIÓW"},
 }
 
+CSV_FIELDNAMES = [
+    "Data pomiaru",
+    "Data kursu",
+    "Godzina odjazdu",
+    "Godzina przyjazdu",
+    "Cena (PLN)",
+    "Wolne miejsca",
+]
+
 
 @dataclass
 class Departure:
@@ -236,12 +245,22 @@ class ArgusCore:
         ret = self._parse_ga4_items(ga4[1].get("items", [])) if len(ga4) > 1 else {}
         return there, ret
 
+    # =====================================================================
+    #               WARSTWA PAMIĘCI I BAZY DANYCH (CSV)
+    # =====================================================================
+
     def get_csv_filename(self, origin: str, destination: str) -> str:
+        """Generuje pełną ścieżkę w folderze data/, np. 'data/ceny_wroclaw_krosno.csv'."""
         f_key = self._normalize_string(self.resolve_stop(origin)["name"].split()[0])
         t_key = self._normalize_string(self.resolve_stop(destination)["name"].split()[0])
         return os.path.join(self.data_dir, f"ceny_{f_key}_{t_key}.csv")
 
     def load_previous_snapshot(self, csv_file: str) -> Dict[Tuple[str, str], int]:
+        """
+        Wczytuje z pliku CSV ostatnie znane stany wolnych miejsc:
+        Zwraca mapę: {(date_str, dep_time): free_seats}
+        Kompatybilne wstecznie ze starym nagłówkiem 'Godzina' i nowym 'Godzina odjazdu'.
+        """
         prev_map = {}
         if not os.path.isfile(csv_file):
             return prev_map
@@ -250,7 +269,7 @@ class ArgusCore:
                 reader = csv.DictReader(f)
                 for row in reader:
                     d = row.get("Data kursu")
-                    h = row.get("Godzina")
+                    h = row.get("Godzina odjazdu") or row.get("Godzina")
                     s = row.get("Wolne miejsca")
                     if d and h and s and s.isdigit():
                         prev_map[(d, h)] = int(s)
@@ -259,6 +278,10 @@ class ArgusCore:
         return prev_map
 
     def save_and_rotate_csv(self, csv_file: str, courses: List[Departure]):
+        """
+        Zapisuje nowe pomiary do bazy CSV z podziałem na godzinę odjazdu i przyjazdu
+        oraz przenosi przeszłe kursy do archiwum (data/archive/arch_*.csv).
+        """
         if not courses:
             return
 
@@ -269,7 +292,13 @@ class ArgusCore:
         if os.path.isfile(csv_file):
             try:
                 with open(csv_file, "r", encoding="utf-8") as f:
-                    existing_rows = list(csv.DictReader(f))
+                    for r in csv.DictReader(f):
+                        # Migracja starej kolumny 'Godzina' jeśli istnieje
+                        if "Godzina" in r and "Godzina odjazdu" not in r:
+                            r["Godzina odjazdu"] = r.pop("Godzina")
+                        if "Godzina przyjazdu" not in r:
+                            r["Godzina przyjazdu"] = "--:--"
+                        existing_rows.append(r)
             except Exception:
                 existing_rows = []
 
@@ -277,7 +306,8 @@ class ArgusCore:
             {
                 "Data pomiaru": ts_now,
                 "Data kursu": c.date,
-                "Godzina": c.departure_time,
+                "Godzina odjazdu": c.departure_time,
+                "Godzina przyjazdu": c.arrival_time,
                 "Cena (PLN)": f"{c.price:.2f}",
                 "Wolne miejsca": str(c.free_seats),
             }
@@ -298,24 +328,26 @@ class ArgusCore:
             except Exception:
                 active_rows.append(r)
 
+        # Zapis do archiwum w data/archive/
         if archive_rows:
             os.makedirs(self.archive_dir, exist_ok=True)
             arch_file = os.path.join(self.archive_dir, f"arch_{os.path.basename(csv_file)}")
             file_exists = os.path.isfile(arch_file)
             with open(arch_file, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(
-                    f, fieldnames=["Data pomiaru", "Data kursu", "Godzina", "Cena (PLN)", "Wolne miejsca"]
-                )
+                writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
                 if not file_exists:
                     writer.writeheader()
                 writer.writerows(archive_rows)
 
+        # Nadpisanie pliku aktywnego w data/
         with open(csv_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f, fieldnames=["Data pomiaru", "Data kursu", "Godzina", "Cena (PLN)", "Wolne miejsca"]
-            )
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
             writer.writeheader()
             writer.writerows(active_rows)
+
+    # =====================================================================
+    #               GŁÓWNA METODA Z ADAPTACYJNYM WARM-START
+    # =====================================================================
 
     def fetch_roundtrip_day(
         self,
@@ -356,6 +388,7 @@ class ArgusCore:
         if check_seats and all_courses:
             cache = {1: (set(there_base.keys()), set(return_base.keys()))}
 
+            # 1. Warm-Start: sprawdzamy zapamiętane wartości z bazy danych
             warm_probes = set()
             for c in all_courses:
                 if c["prev_val"] and isinstance(c["prev_val"], int) and 1 < c["prev_val"] <= self.max_capacity:
@@ -378,6 +411,7 @@ class ArgusCore:
                             else:
                                 c["high"] = min(c["high"], probe - 1)
 
+            # 2. Sonda na 50 i MAX_CAPACITY dla pozostałych
             remaining = [c for c in all_courses if c["low"] < c["high"]]
             if remaining:
                 for probe in [self.max_capacity, 50]:
@@ -397,6 +431,7 @@ class ArgusCore:
                             else:
                                 c["high"] = min(c["high"], probe - 1)
 
+            # 3. Klasyczny binary search dla nierozstrzygniętych
             while True:
                 pending = [c for c in all_courses if c["low"] < c["high"]]
                 if not pending:
